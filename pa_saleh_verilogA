@@ -1,0 +1,103 @@
+// Verilog-A Saleh PA with third-order Taylor response and RC envelope memory
+// Compatibility: Cadence Spectre, HB / Transient simulation
+// Complex baseband envelope (I/Q differential)
+`include "constants.vams"
+`include "disciplines.vams"
+
+module saleh_pa_mem_taylor (Ip, In, Qp, Qn, Iop, Ion, Qop, Qon);
+
+input Ip, In, Qp, Qn;
+output Iop, Ion, Qop, Qon;
+electrical Ip, In, Qp, Qn, Iop, Ion, Qop, Qon;
+
+// ========== Parameters ==========
+parameter real G0_dB      = 10.0;      // Small-signal power gain (dB)
+parameter real Psat_dBm    = 15.0;       // Saturated output power (dBm, referenced to 50 ohms)
+parameter real OP1dB_dBm   = 12.0;     // Output power at P1dB (dBm, referenced to 50 ohms)
+parameter real Ph_max_deg  = 30.0;      // Maximum AM-PM phase shift (degrees)
+parameter real tau_mem = 100e-9;    // RC memory time constant (s)
+parameter real a3      = -0.1;      // Third-order Taylor coefficient
+parameter integer mode = 2;         // 0: Saleh only; 1: Taylor only; 2: Saleh with RC memory; 3: Saleh and Taylor combined
+parameter real R0 = 50.0;           // System reference impedance
+parameter real beta_phi = 0.1;      // AM-PM coefficient for Saleh model (rad/W)
+
+// Internal variables
+real G0 = pow(10, G0_dB/10.0);  // Small-signal power gain (linear)
+real Psat_w = 1e-3 * pow(10, Psat_dBm/10.0);  // Saturated output power (W)
+real OP1dB_w = 1e-3 * pow(10, OP1dB_dBm/10.0);  // Output power at P1dB (W)
+real pi = 3.1415926535;
+real deg2rad = pi/180.0;
+real rad2deg = 180.0/pi;
+
+real vi, vq;                // Differential I/Q input
+real vin_mag;               // Input envelope magnitude
+real vout_mag_saleh;        // Saleh AM-AM output magnitude
+real phi_ampm;              // AM-PM phase shift (rad)
+real phi_total;
+real vout_mag_taylor;       // Third-order Taylor output magnitude
+real vout_mag;
+real io, qo;                // Output I/Q complex envelope
+real alpha, beta; 			// Saleh coefficients derived from Psat and G0
+real pin_w;                 // Input power
+real v_env_mem;             // Filtered envelope-memory state
+real v_env_raw;
+
+analog begin
+    // 1. Sample differential I/Q inputs
+    vi = V(Ip, In);
+    vq = V(Qp, Qn);
+    vin_mag = sqrt(vi*vi + vq*vq);
+
+    // 2. Solve the Saleh parameters: Aout = alpha*Ain/(1+beta*Ain^2)
+    // At saturation, d(Aout)/dAin = 0, so beta = -1/(Ain_sat^2+2*Ain_sat)
+    alpha = G0;
+    beta = -1/(Psat_w*Psat_w/2/Psat_w);  
+
+    // Unfiltered envelope
+    v_env_raw = vin_mag;
+
+    // ========== First-order RC envelope-memory low-pass ==========
+    if(mode == 2 || mode ==3) begin
+        v_env_mem = idt((v_env_raw - v_env_mem)/tau_mem, v_env_raw);
+    end else begin
+        v_env_mem = v_env_raw;
+    end
+
+    // ========== Saleh AM-AM and AM-PM ==========
+    vout_mag_saleh = alpha * v_env_mem / (1.0 + beta * v_env_mem * v_env_mem);
+    // Engineering Saleh AM-PM form: phase shift rises with the envelope and saturates
+    phi_ampm = Ph_max * deg2rad * (v_env_mem*v_env_mem) / (1.0 + beta_phi * v_env_mem * v_env_mem);
+
+    // ========== Third-order Taylor nonlinearity: Aout = G0*Ain + a3*Ain^3 ==========
+    vout_mag_taylor = G0 * v_env_mem + a3 * (v_env_mem**3);
+    if(vout_mag_taylor < 0) vout_mag_taylor = 0;
+
+    // ========== Mode selection ==========
+    case(mode)
+        0: begin vout_mag = vout_mag_saleh; phi_total = phi_ampm; end
+        1: begin vout_mag = vout_mag_taylor; phi_total = 0; end
+        2: begin vout_mag = vout_mag_saleh; phi_total = phi_ampm; end
+        3: begin
+            // Combine Saleh and Taylor responses (useful for DPD and IP3 comparison)
+            vout_mag = (vout_mag_saleh + vout_mag_taylor)/2.0;
+            phi_total = phi_ampm;
+        end
+    endcase
+
+    // Rotate the complex envelope: preserve input phase and apply the AM-PM shift
+    if(vin_mag > 1e-15) begin
+        io = vout_mag * (vi / vin_mag) * cos(phi_total) - vout_mag * (vq / vin_mag) * sin(phi_total);
+        qo = vout_mag * (vi / vin_mag) * sin(phi_total) + vout_mag * (vq / vin_mag) * cos(phi_total);
+    end else begin
+        io = 0;
+        qo = 0;
+    end
+
+    // Differential output voltages
+    V(Iop, Ion) <+ io;
+    V(Qop, Qon) <+ qo;
+
+    // Optional monitor output (disable during HB Pin sweeps to avoid excessive logging)
+    // $strobe("time=%g, Pin=%g, Vout_mag=%g, Phase_deg=%g", $abstime, vin_mag*vin_mag/(2*R0), vout_mag, phi_total*rad2deg);
+end
+endmodule
